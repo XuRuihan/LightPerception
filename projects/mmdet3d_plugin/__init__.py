@@ -15,6 +15,7 @@ from .datasets.pipelines import (
   PhotoMetricDistortionMultiViewImage, PadMultiViewImage, 
   NormalizeMultiviewImage)
 from .models.backbones.vovnet import VoVNet
+from .models.backbones.timm_backbone import TimmModel
 # from .models.backbones.rednet import RedNet
 from .models.detectors.obj_dgcnn import ObjDGCNN
 from .models.detectors.detr3d import Detr3D
