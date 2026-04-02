@@ -6,6 +6,7 @@ from mmdet.models.backbones.resnet import BasicBlock
 from mmdet.models.builder import build_loss
 
 from mmcv.utils import Registry, build_from_cfg
+from .conv import Conv
 
 DepthNet = Registry('depthnet')
 
@@ -13,6 +14,34 @@ DepthNet = Registry('depthnet')
 def build_depthnet(cfg, default_args=None):
     """Builder for transformer encoder and transformer decoder."""
     return build_from_cfg(cfg, DepthNet, default_args)
+
+
+class CustomDepthBlock(nn.Module):
+    """Universal inverted residual block for depth prediction."""
+
+    def __init__(self, channels):
+        super(CustomDepthBlock, self).__init__()
+        hidden_channels = channels
+        self.expand_conv = Conv(channels, hidden_channels * 2, act=False)
+        self.depthwise_conv = Conv(hidden_channels, hidden_channels, k=5, s=1, p=2, g=4, act=False)
+        self.project_conv = Conv(hidden_channels, channels, k=3, s=1, p=1, act=False)
+
+    def forward(self, x):
+        identity = x
+        x = self.expand_conv(x)
+        x1, x2 = x.chunk(2, 1)
+        x = self.depthwise_conv(F.relu(x1)) * F.hardsigmoid(x2)
+        x = self.project_conv(x)
+        x = x + identity
+        return x
+
+
+def build_depth_block(block_type, channels):
+    if block_type == 'basic':
+        return BasicBlock(channels, channels)
+    if block_type == 'custom':
+        return CustomDepthBlock(channels)
+    raise ValueError(f'Unsupported depth block type: {block_type}')
 
 
 class _ASPPModule(nn.Module):
@@ -176,12 +205,13 @@ class SELayer(nn.Module):
 class CameraAwareDepthNet(nn.Module):
     def __init__(self, in_channels, mid_channels, context_channels, depth_channels, num_params1=18,
                  num_params2=6, with_depth_correction=False, with_context_encoder=False, 
-                 with_pgd=False):
+                 with_pgd=False, depth_block_type='basic'):
         super(CameraAwareDepthNet, self).__init__()
         self.in_channels = in_channels
         self.context_channels = context_channels
         self.depth_channels = depth_channels
         self.mid_channels = mid_channels
+        self.depth_block_type = depth_block_type
 
         self.reduce_conv = ConvModule(
             in_channels=in_channels,
@@ -210,9 +240,9 @@ class CameraAwareDepthNet(nn.Module):
         self.depth_se = SELayer(mid_channels)
         if with_depth_correction:
             self.depth_stem = nn.Sequential(
-                BasicBlock(mid_channels, mid_channels),
-                BasicBlock(mid_channels, mid_channels),
-                BasicBlock(mid_channels, mid_channels),
+                build_depth_block(depth_block_type, mid_channels),
+                build_depth_block(depth_block_type, mid_channels),
+                build_depth_block(depth_block_type, mid_channels),
                 ASPP(mid_channels, mid_channels),
             )
             self.depth_prob_conv = nn.Sequential(
@@ -226,6 +256,7 @@ class CameraAwareDepthNet(nn.Module):
                     # im2col_step=128,
                 )),
                 nn.BatchNorm2d(mid_channels),
+                nn.ReLU(),
                 nn.Conv2d(mid_channels, depth_channels, kernel_size=1, stride=1, padding=0)
             )
         else:

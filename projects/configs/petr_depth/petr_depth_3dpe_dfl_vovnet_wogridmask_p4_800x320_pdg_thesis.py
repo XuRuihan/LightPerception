@@ -10,7 +10,7 @@ model = dict(
             with_context_encoder=False,
             with_pgd=True,
             depth_channels=16,
-            depth_block_type='basic',
+            depth_block_type='custom',
         ),
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         use_dfl=True,
