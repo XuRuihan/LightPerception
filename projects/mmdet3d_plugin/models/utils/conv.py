@@ -16,7 +16,7 @@ class Conv(nn.Module):
 
     default_act = nn.ReLU()
 
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, zero_init=False):
         super().__init__()
         self.conv = nn.Conv2d(
             c1,
@@ -30,6 +30,8 @@ class Conv(nn.Module):
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
         self._init_weight()
+        if zero_init:
+            nn.init.zeros_(self.conv.weight)
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))

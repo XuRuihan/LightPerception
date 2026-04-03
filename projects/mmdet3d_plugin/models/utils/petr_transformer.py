@@ -67,16 +67,16 @@ class PETRTransformer(BaseModule):
                 xavier_init(m, distribution='uniform')
         self._is_init = True
 
-    def forward(self, x, mask, query_embed, pos_embed, reg_branch=None):
+    def forward(self, x, mask, q_pos_emb, k_pos_emb, reg_branch=None, v_pos_emb=None):
         """Forward function for `Transformer`.
         Args:
             x (Tensor): Input query with shape (B, N_view, C, H, W) where
                 C = embed_dims.
             mask (Tensor): The key_padding_mask used for encoder and decoder,
                 with shape (B, N_view, H, W).
-            query_embed (Tensor): The query embedding for decoder, with shape
+            q_pos_emb (Tensor): The query embedding for decoder, with shape
                 (N_query, embed_dims).
-            pos_embed (Tensor): The positional encoding for encoder and
+            k_pos_emb (Tensor): The positional encoding for encoder and
                 decoder, with the same shape as `x`.    (B, N_view, embed_dims, H, W)
         Returns:
             tuple[Tensor]: results of decoder containing the following tensor.
@@ -92,22 +92,25 @@ class PETRTransformer(BaseModule):
         # (B, N_view, C, H, W) --> (N_view, H, W, B, C) --> (L=N_view*H*W, B, C)
         memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c)
         # (B, N_view, C, H, W) --> (N_view, H, W, B, C) --> (L=N_view*H*W, B, C)
-        pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c)
+        k_pos_emb = k_pos_emb.permute(1, 3, 4, 0, 2).reshape(-1, bs, c)
+        if v_pos_emb is not None:
+            v_pos_emb = v_pos_emb.permute(1, 3, 4, 0, 2).reshape(-1, bs, c)
+        else:
+            v_pos_emb = torch.zeros_like(k_pos_emb)
 
         # (N_query, 1, C=embed_dims) --> (N_query, B, C=embed_dims)
-        query_embed = query_embed.unsqueeze(1).repeat(
-            1, bs, 1)
+        q_pos_emb = q_pos_emb.unsqueeze(1).repeat(1, bs, 1)
         # 用于在做cross-attention时, 消除图像pad部分的影响.
         mask = mask.view(bs, -1)    # (B, N_view, H, W) --> (B, L=N_view*H*W)
-        target = torch.zeros_like(query_embed)      # (N_query, B, C=embed_dims)
+        target = torch.zeros_like(q_pos_emb)      # (N_query, B, C=embed_dims)
 
         # out_dec: [num_layers, num_query, bs, dim]
         out_dec = self.decoder(
             query=target,   # (N_query, B, C=embed_dims)
             key=memory,     # (L=N_view*H*W, B, C)
-            value=memory,   # (L=N_view*H*W, B, C)
-            key_pos=pos_embed,  # (L=N_view*H*W, B, C)
-            query_pos=query_embed,  # (N_query, B, C=embed_dims)
+            value=memory + v_pos_emb,   # (L=N_view*H*W, B, C)
+            key_pos=k_pos_emb,  # (L=N_view*H*W, B, C)
+            query_pos=q_pos_emb,  # (N_query, B, C=embed_dims)
             key_padding_mask=mask,  # (B, L=N_view*H*W)
             reg_branch=reg_branch,
             )   # (num_layers, num_query, bs, embed_dims)

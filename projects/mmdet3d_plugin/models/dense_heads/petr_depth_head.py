@@ -850,6 +850,11 @@ class PETRDepthHeadV2(PETRDepthHead):
                     nn.ReLU(),
                     nn.Linear(self.embed_dims, self.embed_dims),
                 )
+        self.v_position_embedding = nn.Sequential(
+            nn.Linear(self.embed_dims*3//2, self.embed_dims),
+            nn.ReLU(),
+            nn.Linear(self.embed_dims, self.embed_dims),
+        )
 
         if self.with_pos_info:
             self.extra_position_encoder = nn.Sequential(
@@ -872,17 +877,15 @@ class PETRDepthHeadV2(PETRDepthHead):
         depth_val = F.linear(depth_score, self.project.type_as(depth_score)).squeeze(-1)  # (N, D) * (D, )  --> (N, )
         return depth_val
 
-    def position_embeding(self, img_feats, img_metas, masks=None, depth_map=None):
+    def get_coords_3d(self, img_feats, img_metas, depth_map):
         """
         Args:
             img_feats: List[(B, N_view, C, H, W), ]
             img_metas:
-            masks: (B, N_view, H, W)
             depth_map: (B, N_view, H, W)
             depth_map_mask: (B, N_view, H, W)
         Returns:
-            coords_position_embeding: (B, N_view, embed_dims, H, W)
-            coords_mask: (B, N_view, H, W)
+            coords3d: (B, N_view, W, H, 3)
         """
         eps = 1e-5
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
@@ -932,6 +935,11 @@ class PETRDepthHeadV2(PETRDepthHead):
                     self.position_range[4] - self.position_range[1])
         coords3d[..., 2:3] = (coords3d[..., 2:3] - self.position_range[2]) / (
                     self.position_range[5] - self.position_range[2])
+        return coords3d
+
+    def position_embeding(self, img_feats, img_metas, masks=None, depth_map=None):
+        B, N, C, H, W = img_feats[self.position_level].shape
+        coords3d = self.get_coords_3d(img_feats, img_metas, depth_map)  # (B, N_view, W, H, 3)
 
         coords_mask = (coords3d > 1.0) | (coords3d < 0.0)  # (B, N_view, W, H, 3), 超出range的points mask
         coords_mask = coords_mask.sum(dim=-1) > 0       # (B, N_view, W, H)
@@ -939,12 +947,13 @@ class PETRDepthHeadV2(PETRDepthHead):
         coords_mask = masks | coords_mask.permute(0, 1, 3, 2)  # (B, N_view, H, W)
 
         coords3d = coords3d.permute(0, 1, 3, 2, 4).contiguous().view(B*N, H, W, 3)      # (B*N_view, H, W, 3)
-        coords3d = inverse_sigmoid(coords3d)    # (B*N_view, H, W, 3)
+        coords3d = pos2posemb3d(inverse_sigmoid(coords3d))    # (B*N_view, H, W, 3)
         # 3D position embedding(PE)
-        coords_position_embeding = self.position_encoder(pos2posemb3d(coords3d))  # (B*N_view, H, W, embed_dims)
+        coords_position_embeding = self.position_encoder(coords3d)  # (B*N_view, H, W, embed_dims)
+        v_position_embedding = self.v_position_embedding(coords3d)  # (B*N_view, H, W, embed_dims)
         coords_position_embeding = coords_position_embeding.permute(0, 3, 1, 2).contiguous()    # (B*N_view, embed_dims, H, W)
 
-        return coords_position_embeding.view(B, N, self.embed_dims, H, W), coords_mask
+        return coords_position_embeding.view(B, N, self.embed_dims, H, W), coords_mask, v_position_embedding.view(B, N, self.embed_dims, H, W)
 
     def forward(self, mlvl_feats, img_metas):
         """Forward function.
@@ -1037,7 +1046,7 @@ class PETRDepthHeadV2(PETRDepthHead):
             else:
                 depth_map = depth_map_pred
             depth_map = depth_map.view(batch_size, num_cams, fH, fW)
-            coords_position_embeding, _ = self.position_embeding(mlvl_feats, img_metas, masks, depth_map)
+            coords_position_embeding, _, v_position_embedding = self.position_embeding(mlvl_feats, img_metas, masks, depth_map)
             pos_embed = coords_position_embeding
             if self.with_multiview:
                 # 加入 2D PE 和 multi-view prior
@@ -1086,7 +1095,8 @@ class PETRDepthHeadV2(PETRDepthHead):
                                        masks,  # (B, N_view, H, W)
                                        query_embeds,  # (N_query, embed_dims)
                                        pos_embed,  # (B, N_view, embed_dims, H, W)
-                                       self.reg_branches  # 没有进行box_refine, 因此没有用到reg_branches.
+                                       self.reg_branches,  # 没有进行box_refine, 因此没有用到reg_branches.
+                                       v_position_embedding
                                        )
         # outs_dec = torch.nan_to_num(outs_dec)  # (num_layers, B, N_query, C=embed_dims)
         # torch.cuda.synchronize()
