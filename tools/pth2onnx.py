@@ -116,7 +116,7 @@ def main():
     if fp16_cfg is not None:
         wrap_fp16_model(model)
     if args.checkpoint:
-        checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+        checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu', strict=True)
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     if args.checkpoint:
@@ -328,10 +328,11 @@ def main():
             # outs = mod.pts_bbox_head(img_feats.unsqueeze(0), self.img_metas)  # For PETR
             outs = mod.pts_bbox_head(img_feats, self.img_metas)  # For 3DPPE
 
-            # all_cls_scores: [nb_dec, bs, num_query, cls_out_channels]
-            # all_bbox_preds: [nb_dec, bs, num_query, 10]  // assume x,y,z,w,l,h,yaw,vx,vy,vz
+            # all_cls_scores: [n_layers, bs, num_query, cls_out_channels]
+            # all_bbox_preds: [n_layers, bs, num_query, 10]
+            # layout: (cx, cy, log_dx, log_dy, cz, log_dz, sin_rot, cos_rot, vx, vy)
             all_cls_scores, all_bbox_preds = outs["all_cls_scores"], outs["all_bbox_preds"]
-            return all_cls_scores[-1], all_bbox_preds[-1]
+            return torch.softmax(all_cls_scores[-1], dim=-1), all_bbox_preds[-1]
 
     model.eval()
     model = model.float()
@@ -356,7 +357,8 @@ def main():
     tm_args = tuple(arrs)
 
     filename = args.section + ".onnx"
-    onnx_path = os.path.join("work_dirs/", args.section, filename)
+    export_dir = os.path.dirname(args.checkpoint)
+    onnx_path = os.path.join(export_dir, filename)
     with torch.no_grad():
         torch.onnx.export(
             tm,
@@ -371,7 +373,7 @@ def main():
 
     onnx_model = onnx.load(onnx_path)
     onnx_model_simp, check = simplify(onnx_model)
-    simpified_onnx_path = os.path.join("work_dirs/", args.section, "simplify_" + filename)
+    simpified_onnx_path = os.path.join(export_dir, "simplify_" + filename)
     onnx.save(onnx_model_simp, simpified_onnx_path)
 
     print(args.section + " onnx export success!")
@@ -385,3 +387,4 @@ if __name__ == "__main__":
 # CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m tools.pth2onnx --section petr projects/configs/petr/petr_vovnet_gridmask_p4_800x320.py --checkpoint work_dirs/petr/epoch_24.pth
 # CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m tools.pth2onnx --section 3dppe projects/configs/petr_depth/petr_depth_3dpe_dfl_vovnet_wogridmask_p4_800x320_pdg.py --checkpoint work_dirs/3dppe/epoch_24.pth
 # CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m tools.pth2onnx --section 3dppe projects/configs/petr_depth/petr_depth_3dpe_dfl_vovnet_wogridmask_p4_800x320_pdg.py --checkpoint work_dirs/petr_depth_3dpe_dfl_vovnet_wogridmask_p4_800x320_pdg/epoch_23.pth
+# CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m tools.pth2onnx --section 3dppe_v_pe projects/configs/petr_depth/petr_depth_3dpe_dfl_vovnet_wogridmask_p4_800x320_pdg_thesis.py --checkpoint work_dirs/petr_depth_3dpe_dfl_vovnet_wogridmask_p4_800x320_pdg_thesis/latest.pth
