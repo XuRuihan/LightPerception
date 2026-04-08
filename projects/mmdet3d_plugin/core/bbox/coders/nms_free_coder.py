@@ -14,17 +14,20 @@ from mmdet.core.bbox.builder import BBOX_CODERS
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox
 import torch.nn.functional as F
 
+
 @BBOX_CODERS.register_module()
 class NMSFreeCoder(BaseBBoxCoder):
-    """Bbox coder for NMS-free detector.
+    """BBox coder for NMS-free detectors.
+
     Args:
         pc_range (list[float]): Range of point cloud.
-        post_center_range (list[float]): Limit of the center.
-            Default: None.
+        voxel_size (list[float], optional): Size of each voxel. Default: None.
+        post_center_range (list[float], optional): Center range used to filter
+            decoded boxes. Default: None.
         max_num (int): Max number to be kept. Default: 100.
-        score_threshold (float): Threshold to filter boxes based on score.
-            Default: None.
-        code_size (int): Code size of bboxes. Default: 9
+        score_threshold (float, optional): Threshold to filter boxes based on
+            score. Default: None.
+        num_classes (int): Number of foreground classes. Default: 10.
     """
 
     def __init__(self,
@@ -45,26 +48,47 @@ class NMSFreeCoder(BaseBBoxCoder):
     def encode(self):
         pass
 
-    def decode_single(self, cls_scores, bbox_preds):
-        """Decode bboxes.
+    def _select_topk(self, cls_scores, bbox_preds):
+        """Select top-k predictions from sigmoid classification logits.
+
         Args:
-            cls_scores (Tensor): Outputs from the classification head, \
-                shape [num_query, cls_out_channels]. Note \
-                cls_out_channels should includes background.
-            bbox_preds (Tensor): Outputs from the regression \
-                head with normalized coordinate format (cx, cy, w, l, cz, h, rot_sine, rot_cosine, vx, vy). \
-                Shape [num_query, 9].
+            cls_scores (Tensor): Classification logits with shape
+                [num_query, num_classes].
+            bbox_preds (Tensor): Normalized box predictions with shape
+                [num_query, code_size].
+
         Returns:
-            list[dict]: Decoded boxes.
+            tuple[Tensor, Tensor, Tensor]: Top-k scores, labels, and aligned
+            bbox predictions.
         """
         max_num = self.max_num
 
         cls_scores = cls_scores.sigmoid()       # (num_query, n_cls)
-        scores, indexs = cls_scores.view(-1).topk(max_num)
-        labels = indexs % self.num_classes
-        bbox_index = indexs // self.num_classes
+        query_scores, labels = cls_scores.max(dim=-1)
+        scores, bbox_index = query_scores.topk(max_num)
+        labels = labels[bbox_index]
         bbox_preds = bbox_preds[bbox_index]     # (max_num, code_size)  code_size: (cx, cy, log(dx), log(dy), cz, log(dz), sin(rot), cos(rot), vx, vy)
+        return scores, labels, bbox_preds
 
+    def _get_post_center_range(self, device):
+        if self.post_center_range is None:
+            return None
+        if isinstance(self.post_center_range, torch.Tensor):
+            return self.post_center_range.to(device=device)
+        return torch.tensor(self.post_center_range, device=device)
+
+    def _build_predictions(self, scores, labels, bbox_preds):
+        """Build final prediction dict from filtered top-k candidates.
+
+        Args:
+            scores (Tensor): Top-k scores with shape [num_pred].
+            labels (Tensor): Predicted labels with shape [num_pred].
+            bbox_preds (Tensor): Normalized bbox predictions with shape
+                [num_pred, code_size].
+
+        Returns:
+            dict: Prediction dict containing `bboxes`, `scores`, and `labels`.
+        """
         final_box_preds = denormalize_bbox(bbox_preds, self.pc_range)    # (max_num, 7/9)  code_size: (cx, cy, cz, dx, dy, dz, ry, vx, vy)
         final_scores = scores       # (max_num, )
         final_preds = labels        # (max_num, )
@@ -72,15 +96,13 @@ class NMSFreeCoder(BaseBBoxCoder):
         # use score threshold
         if self.score_threshold is not None:
             thresh_mask = final_scores > self.score_threshold
-        if self.post_center_range is not None:
-            self.post_center_range = torch.tensor(self.post_center_range, device=scores.device)
+        post_center_range = self._get_post_center_range(scores.device)
+        if post_center_range is not None:
             
-            mask = (final_box_preds[..., :3] >=
-                    self.post_center_range[:3]).all(1)
-            mask &= (final_box_preds[..., :3] <=
-                     self.post_center_range[3:]).all(1)
+            mask = (final_box_preds[..., :3] >= post_center_range[:3]).all(1)
+            mask &= (final_box_preds[..., :3] <= post_center_range[3:]).all(1)
 
-            if self.score_threshold:
+            if self.score_threshold is not None:
                 mask &= thresh_mask
 
             boxes3d = final_box_preds[mask]
@@ -93,142 +115,78 @@ class NMSFreeCoder(BaseBBoxCoder):
             }
 
         else:
-            raise NotImplementedError(
-                'Need to reorganize output as a batch, only '
-                'support post_center_range is not None for now!')
+            predictions_dict = {
+                'bboxes': final_box_preds,  # (max_num, 7/9)
+                'scores': final_scores,     # (max_num, )
+                'labels': final_preds       # (max_num, )
+            }
         return predictions_dict
 
-    def decode(self, preds_dicts):
-        """Decode bboxes.
+    def decode_single(self, cls_scores, bbox_preds):
+        """Decode predictions for a single sample.
+
         Args:
-            all_cls_scores (Tensor): Outputs from the classification head, \
-                shape [nb_dec, bs, num_query, cls_out_channels]. Note \
-                cls_out_channels should includes background.
-            all_bbox_preds (Tensor): Sigmoid outputs from the regression \
-                head with normalized coordinate format (cx, cy, w, l, cz, h, rot_sine, rot_cosine, vx, vy). \
-                Shape [nb_dec, bs, num_query, 9].
+            cls_scores (Tensor): Classification logits with shape
+                [num_query, cls_out_channels].
+            bbox_preds (Tensor): Normalized bbox predictions with shape
+                [num_query, code_size]. The default box layout is
+                (cx, cy, w, l, cz, h, rot_sine, rot_cosine, vx, vy).
+
+        Returns:
+            dict: Decoded prediction dict containing `bboxes`, `scores`, and
+            `labels`.
+        """
+        scores, labels, bbox_preds = self._select_topk(cls_scores, bbox_preds)
+        return self._build_predictions(scores, labels, bbox_preds)
+
+    def decode(self, preds_dicts):
+        """Decode predictions for a batch using the last decoder layer.
+
+        Args:
+            preds_dicts (dict): Model outputs containing:
+                - `all_cls_scores` (Tensor): Classification logits of shape
+                  [num_decoder_layers, bs, num_query, cls_out_channels].
+                - `all_bbox_preds` (Tensor): Normalized bbox predictions of
+                  shape [num_decoder_layers, bs, num_query, code_size].
+
         Returns:
             list[dict]: Decoded boxes.
         """
         # 选择最后一层的decode layer的输出
         all_cls_scores = preds_dicts['all_cls_scores'][-1]      # (B, N_query, n_cls)
         all_bbox_preds = preds_dicts['all_bbox_preds'][-1]      # (B, N_query, code_size)
-        
+
         batch_size = all_cls_scores.size()[0]
         predictions_list = []
         for i in range(batch_size):
             predictions_list.append(self.decode_single(all_cls_scores[i], all_bbox_preds[i]))
         return predictions_list
-
 
 
 @BBOX_CODERS.register_module()
-class NMSFreeClsCoder(BaseBBoxCoder):
-    """Bbox coder for NMS-free detector.
-    Args:
-        pc_range (list[float]): Range of point cloud.
-        post_center_range (list[float]): Limit of the center.
-            Default: None.
-        max_num (int): Max number to be kept. Default: 100.
-        score_threshold (float): Threshold to filter boxes based on score.
-            Default: None.
-        code_size (int): Code size of bboxes. Default: 9
+class NMSFreeClsCoder(NMSFreeCoder):
+    """Variant of :class:`NMSFreeCoder` for softmax-based classification.
+
+    This coder assumes the last classification channel is background and
+    selects the best foreground class for each query before applying top-k.
     """
 
-    def __init__(self,
-                 pc_range,
-                 voxel_size=None,
-                 post_center_range=None,
-                 max_num=100,
-                 score_threshold=None,
-                 num_classes=10):
-        
-        self.pc_range = pc_range
-        self.voxel_size = voxel_size
-        self.post_center_range = post_center_range
-        self.max_num = max_num
-        self.score_threshold = score_threshold
-        self.num_classes = num_classes
+    def _select_topk(self, cls_scores, bbox_preds):
+        """Select top-k predictions from softmax classification logits.
 
-    def encode(self):
-        pass
-
-    def decode_single(self, cls_scores, bbox_preds):
-        """Decode bboxes.
         Args:
-            cls_scores (Tensor): Outputs from the classification head, \
-                shape [num_query, cls_out_channels]. Note \
-                cls_out_channels should includes background.
-            bbox_preds (Tensor): Outputs from the regression \
-                head with normalized coordinate format (cx, cy, w, l, cz, h, rot_sine, rot_cosine, vx, vy). \
-                Shape [num_query, 9].
+            cls_scores (Tensor): Classification logits with shape
+                [num_query, num_classes + 1], where the last channel is
+                background.
+            bbox_preds (Tensor): Normalized box predictions with shape
+                [num_query, code_size].
+
         Returns:
-            list[dict]: Decoded boxes.
+            tuple[Tensor, Tensor, Tensor]: Top-k scores, labels, and aligned
+            bbox predictions.
         """
-        max_num = self.max_num
-
-        # cls_scores = cls_scores.sigmoid()
-        # scores, indexs = cls_scores.view(-1).topk(max_num)
-        # labels = indexs % self.num_classes
-        # bbox_index = indexs // self.num_classes
-        # bbox_preds = bbox_preds[bbox_index]
-
-        cls_scores, labels = F.softmax(
-                cls_scores, dim=-1)[..., :-1].max(-1)
-        scores, indexs = cls_scores.view(-1).topk(max_num)
+        cls_scores, labels = F.softmax(cls_scores, dim=-1)[..., :-1].max(-1)
+        scores, indexs = cls_scores.view(-1).topk(self.max_num)
         labels = labels[indexs]
         bbox_preds = bbox_preds[indexs]
-
-        final_box_preds = denormalize_bbox(bbox_preds, self.pc_range)   
-        final_scores = scores 
-        final_preds = labels 
-
-        # use score threshold
-        if self.score_threshold is not None:
-            thresh_mask = final_scores > self.score_threshold
-        if self.post_center_range is not None:
-            self.post_center_range = torch.tensor(self.post_center_range, device=scores.device)
-            
-            mask = (final_box_preds[..., :3] >=
-                    self.post_center_range[:3]).all(1)
-            mask &= (final_box_preds[..., :3] <=
-                     self.post_center_range[3:]).all(1)
-
-            if self.score_threshold:
-                mask &= thresh_mask
-
-            boxes3d = final_box_preds[mask]
-            scores = final_scores[mask]
-            labels = final_preds[mask]
-            predictions_dict = {
-                'bboxes': boxes3d,
-                'scores': scores,
-                'labels': labels
-            }
-
-        else:
-            raise NotImplementedError(
-                'Need to reorganize output as a batch, only '
-                'support post_center_range is not None for now!')
-        return predictions_dict
-
-    def decode(self, preds_dicts):
-        """Decode bboxes.
-        Args:
-            preds_dicts = {
-              'all_cls_scores': (num_layers, B, N_query, n_cls)
-              'all_bbox_preds': (num_layers, B, N_query, code_size)   code_size: (cx, cy, log(dx), log(dy), cz, log(dz), sin(rot), cos(rot), vx, vy)
-              'enc_cls_scores': None,
-              'enc_bbox_preds': None,
-            }
-        Returns:
-            list[dict]: Decoded boxes.
-        """
-        all_cls_scores = preds_dicts['all_cls_scores'][-1]
-        all_bbox_preds = preds_dicts['all_bbox_preds'][-1]
-        
-        batch_size = all_cls_scores.size()[0]
-        predictions_list = []
-        for i in range(batch_size):
-            predictions_list.append(self.decode_single(all_cls_scores[i], all_bbox_preds[i]))
-        return predictions_list
+        return scores, labels, bbox_preds

@@ -11,7 +11,6 @@
 import torch
 import torch.nn.functional as F
 import mmcv
-import numpy as np
 from mmcv.parallel import DataContainer as DC
 from os import path as osp
 from mmcv.runner import force_fp32, auto_fp16
@@ -71,10 +70,7 @@ class Petr3D_Depth(MVXTwoStageDetector):
             for img_meta in img_metas:
                 img_meta.update(input_shape=input_shape)
             if img.dim() == 5:
-                if img.size(0) == 1 and img.size(1) != 1:
-                    img.squeeze_()
-                else:
-                    img = img.view(B * N, C, H, W)      # (B*N_view, C=3, H, W)
+                img = img.view(B * N, C, H, W)      # (B*N_view, C=3, H, W)
             if self.use_grid_mask:
                 # (B*N_view, C=3, H, W),  (B*N_view, H, W)
                 img, mask = self.grid_mask(img)

@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+import sys
 import warnings
 
 import mmcv
@@ -31,6 +32,16 @@ try:
     from mmdet.utils import compat_cfg
 except ImportError:
     from mmdet3d.utils import compat_cfg
+
+try:
+    from mmcv.cnn import get_model_complexity_info
+except ImportError:
+    get_model_complexity_info = None
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 
 def parse_args():
@@ -125,6 +136,44 @@ def parse_args():
         warnings.warn('--options is deprecated in favor of --eval-options')
         args.eval_options = args.options
     return args
+
+
+def print_model_stats(model, data_loader):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters()
+                           if p.requires_grad)
+    split_line = '=' * 30
+    print(f'{split_line}\n'
+          f'Total params: {total_params / 1e6:.2f} M ({total_params})\n'
+          f'Trainable params: {trainable_params / 1e6:.2f} M '
+          f'({trainable_params})')
+
+    if get_model_complexity_info is None:
+        print('FLOPs: unavailable because mmcv.cnn.get_model_complexity_info '
+              'is not installed.\n'
+              f'{split_line}')
+        return
+
+    try:
+        sample = next(iter(data_loader))
+
+        def input_constructor(_):
+            inputs = dict(sample)
+            inputs.update(return_loss=False, rescale=True)
+            return inputs
+
+        flops, params = get_model_complexity_info(
+            model,
+            input_shape=(1, ),
+            print_per_layer_stat=False,
+            input_constructor=input_constructor)
+        print(f'FLOPs: {flops}\n'
+              f'Params (mmcv): {params}\n'
+              f'{split_line}')
+    except Exception as exc:
+        print('FLOPs: unavailable for the current model/input pipeline.\n'
+              f'Reason: {type(exc).__name__}: {exc}\n'
+              f'{split_line}')
 
 
 def main():
@@ -250,12 +299,15 @@ def main():
 
     if not distributed:
         model = MMDataParallel(model, device_ids=cfg.gpu_ids)
+        print_model_stats(model, data_loader)
         outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
+        if get_dist_info()[0] == 0:
+            print('Model stats are only supported in non-distributed test mode.')
         outputs = multi_gpu_test(model, data_loader, args.tmpdir,
                                  args.gpu_collect)
 

@@ -22,10 +22,25 @@ from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
-import numpy as np
 from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
 from mmdet.models.utils import NormedLinear
+
+
+def stack_img_meta_matrices(img_metas, key, device, dtype=torch.float32):
+    matrices = []
+    for img_meta in img_metas:
+        matrices.append(torch.as_tensor(img_meta[key], device=device, dtype=dtype))
+    return torch.stack(matrices, dim=0)
+
+
+def get_img2lidars(img_metas, device, dtype=torch.float32):
+    if 'img2lidar' in img_metas[0]:
+        return stack_img_meta_matrices(img_metas, 'img2lidar', device, dtype)
+    lidar2imgs = stack_img_meta_matrices(img_metas, 'lidar2img', device, dtype)
+    return torch.linalg.inv(lidar2imgs)
+
+
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -408,14 +423,7 @@ class PETRHeadseg(AnchorFreeHead):
         coords = torch.cat((coords, torch.ones_like(coords[..., :1])), -1)
         coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(coords[..., 2:3])*eps)
 
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(np.linalg.inv(img_meta['lidar2img'][i]))
-            img2lidars.append(np.asarray(img2lidar))
-        img2lidars = np.asarray(img2lidars)
-        img2lidars = coords.new_tensor(img2lidars) # (B, N, 4, 4)
+        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype) # (B, N, 4, 4)
 
         coords = coords.view(1, 1, W, H, D, 4, 1).repeat(B, N, 1, 1, 1, 1, 1)
         img2lidars = img2lidars.view(B, N, 1, 1, 1, 4, 4).repeat(1, 1, W, H, D, 1, 1)
@@ -552,10 +560,7 @@ class PETRHeadseg(AnchorFreeHead):
         # outs_dec = torch.nan_to_num(outs_dec)
         
         if self.with_time:
-            time_stamps = []
-            for img_meta in img_metas:    
-                time_stamps.append(np.asarray(img_meta['timestamp']))
-            time_stamp = x.new_tensor(time_stamps)
+            time_stamp = stack_img_meta_matrices(img_metas, 'timestamp', x.device, x.dtype)
             time_stamp = time_stamp.view(batch_size, -1, 6)
             mean_time_stamp = (time_stamp[:, 1, :] - time_stamp[:, 0, :]).mean(-1)
             # if mean_time_stamp < 0.25:
@@ -902,4 +907,3 @@ class PETRHeadseg(AnchorFreeHead):
             labels = preds['labels']
             ret_list.append([bboxes, scores, labels])
         return ret_list
-

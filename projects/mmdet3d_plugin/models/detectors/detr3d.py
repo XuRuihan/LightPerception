@@ -45,9 +45,7 @@ class Detr3D(MVXTwoStageDetector):
             for img_meta in img_metas:
                 img_meta.update(input_shape=input_shape)
 
-            if img.dim() == 5 and img.size(0) == 1:
-                img.squeeze_()
-            elif img.dim() == 5 and img.size(0) > 1:
+            if img.dim() == 5:
                 B, N, C, H, W = img.size()
                 img = img.view(B * N, C, H, W)
             if self.use_grid_mask:

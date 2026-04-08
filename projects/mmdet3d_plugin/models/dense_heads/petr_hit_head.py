@@ -22,10 +22,23 @@ from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
-import numpy as np
 from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
 from mmdet.models.utils import NormedLinear
+
+
+def stack_img_meta_matrices(img_metas, key, device, dtype=torch.float32):
+    matrices = []
+    for img_meta in img_metas:
+        matrices.append(torch.as_tensor(img_meta[key], device=device, dtype=dtype))
+    return torch.stack(matrices, dim=0)
+
+
+def get_img2lidars(img_metas, device, dtype=torch.float32):
+    if 'img2lidar' in img_metas[0]:
+        return stack_img_meta_matrices(img_metas, 'img2lidar', device, dtype)
+    lidar2imgs = stack_img_meta_matrices(img_metas, 'lidar2img', device, dtype)
+    return torch.linalg.inv(lidar2imgs)
 
 
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
@@ -330,14 +343,7 @@ class PETRHitHead(AnchorFreeHead):
         coords = torch.cat((coords, torch.ones_like(coords[..., :1])), -1)      # (W, H, D, 4)    4: (u, v, d, 1)
         coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(coords[..., 2:3])*eps)      # (W, H, D, 4)    4: (du, dv, d, 1)
 
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(np.linalg.inv(img_meta['lidar2img'][i]))
-            img2lidars.append(np.asarray(img2lidar))
-        img2lidars = np.asarray(img2lidars)
-        img2lidars = coords.new_tensor(img2lidars)      # (B, N_view, 4, 4)
+        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype)      # (B, N_view, 4, 4)
 
         # (1, 1, W, H, D, 4, 1) --> (B, N_view, W, H, D, 4, 1)
         coords = coords.view(1, 1, W, H, D, 4, 1).repeat(B, N, 1, 1, 1, 1, 1)
@@ -470,14 +476,7 @@ class PETRHitHead(AnchorFreeHead):
         # (1, N_query, 3) --> (B, N_query, 3)
         reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
 
-        lidar2img = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(img_meta['lidar2img'][i])
-            lidar2img.append(np.asarray(img2lidar))
-        lidar2img = np.asarray(lidar2img)
-        lidar2img = x.new_tensor(lidar2img)      # (B, N_view, 4, 4)
+        lidar2img = stack_img_meta_matrices(img_metas, 'lidar2img', x.device, x.dtype)      # (B, N_view, 4, 4)
 
         reference_points_realmetric = torch.zeros_like(reference_points)
         reference_points_realmetric[:, :, 0] = reference_points[:, :, 0] * (self.pc_range[3] - self.pc_range[0]) + \

@@ -11,7 +11,6 @@ import cv2
 import copy
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
 from mmdet3d.models import HEADS, build_loss
 from .petr_head import PETRHead
@@ -25,6 +24,20 @@ from mmdet3d.core.bbox.structures import LiDARInstance3DBoxes
 
 from ..utils.depthnet import build_depthnet
 from mmdet3d.models import builder
+
+
+def stack_img_meta_matrices(img_metas, key, device, dtype=torch.float32):
+    matrices = []
+    for img_meta in img_metas:
+        matrices.append(torch.as_tensor(img_meta[key], device=device, dtype=dtype))
+    return torch.stack(matrices, dim=0)
+
+
+def get_img2lidars(img_metas, device, dtype=torch.float32):
+    if 'img2lidar' in img_metas[0]:
+        return stack_img_meta_matrices(img_metas, 'img2lidar', device, dtype)
+    lidar2imgs = stack_img_meta_matrices(img_metas, 'lidar2img', device, dtype)
+    return torch.linalg.inv(lidar2imgs)
 
 
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
@@ -243,14 +256,7 @@ class PETRDepthHead(PETRHead):
         coords = torch.cat((coords, torch.ones_like(coords[..., :1])), -1)      # (W, H, D, 4)    4: (u, v, d, 1)
         coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(coords[..., 2:3])*eps)      # (W, H, D, 4)    4: (du, dv, d, 1)
 
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(np.linalg.inv(img_meta['lidar2img'][i]))
-            img2lidars.append(np.asarray(img2lidar))
-        img2lidars = np.asarray(img2lidars)
-        img2lidars = coords.new_tensor(img2lidars)      # (B, N_view, 4, 4)
+        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype)      # (B, N_view, 4, 4)
 
         # (1, 1, W, H, D, 4, 1) --> (B, N_view, W, H, D, 4, 1)
         coords = coords.view(1, 1, W, H, D, 4, 1).repeat(B, N, 1, 1, 1, 1, 1)
@@ -341,9 +347,9 @@ class PETRDepthHead(PETRHead):
             # for j in range(depth.shape[0]):
             #     cur_depth_score = depth_score[j]  # (D, fH, fW)
             #     max_depth = torch.argmax(cur_depth_score, dim=0)  # (fH, fW)
-            #     max_depth = max_depth.detach().cpu().numpy()
+            #     max_depth = max_depth.detach().cpu()
             #     max_depth = max_depth * 255 / 63
-            #     max_depth = max_depth.astype(np.uint8)
+            #     max_depth = max_depth.to(torch.uint8)
             #     depth_score_map = cv2.applyColorMap(max_depth, cv2.COLORMAP_RAINBOW)
             #     cv2.imshow("score_map", depth_score_map)
             #     cv2.waitKey(0)
@@ -589,12 +595,12 @@ class PETRDepthHead(PETRHead):
         depth_label, depth_map_mask = self.mask_points_by_dist(depth_label, depth_map_mask, 0, self.depth_num)
 
         # for vis
-        # depth_gt = depth_label.float().detach().cpu().numpy().reshape((6, 16, 44))
-        # depth_mask = depth_map_mask.float().detach().cpu().numpy().reshape((6, 16, 44))
+        # depth_gt = depth_label.float().detach().cpu().reshape((6, 16, 44))
+        # depth_mask = depth_map_mask.float().detach().cpu().reshape((6, 16, 44))
         # depth_gt = depth_gt / self.depth_num * 255
-        # depth_gt = depth_gt.astype(np.uint8)
+        # depth_gt = depth_gt.to(torch.uint8)
         # depth_mask *= 255
-        # depth_mask = depth_mask.astype(np.uint8)
+        # depth_mask = depth_mask.to(torch.uint8)
         # for i in range(6):
         #     depth_gt_vis = cv2.applyColorMap(depth_gt[i], colormap=cv2.COLORMAP_RAINBOW)
         #     cv2.imshow(f'depth {i}', depth_gt_vis)
@@ -676,16 +682,6 @@ class Balancer(nn.Module):
                     u1, v1, u2, v2 = cur_boxes2d
                     fg_mask[batch_idx, view_id, v1:v2, u1:u2] = True
 
-        # for vis
-        # fg_mask = fg_mask[0]    # (N_view, H, W)
-        # for view_id in range(n_view):
-        #     cur_fg_mask = fg_mask[view_id]  # (H, W)
-        #     cur_fg_mask = cur_fg_mask.float().cpu().detach().numpy()
-        #     cur_fg_mask *= 255
-        #     cur_fg_mask = cur_fg_mask.astype(np.uint8)
-        #     cv2.imshow("img", cur_fg_mask)
-        #     cv2.waitKey(0)
-
         return fg_mask
 
     def forward(self, loss, shape, gt_boxes3d, depth_map_mask, img_metas):
@@ -702,19 +698,12 @@ class Balancer(nn.Module):
             loss: (1), Total loss after foreground/background balancing
             tb_dict: dict[float], All losses to log in tensorboard
         """
-        lidar2imgs = []
-        for img_meta in img_metas:
-            lidar2img = []
-            for i in range(len(img_meta['lidar2img'])):
-                lidar2img.append(img_meta['lidar2img'][i])
-            lidar2imgs.append(np.asarray(lidar2img))
-        lidar2img = np.asarray(lidar2imgs)
-        lidar2img = loss.new_tensor(lidar2img)      # (B, N_view, 4, 4)
+        lidar2imgs = stack_img_meta_matrices(img_metas, 'lidar2img', loss.device, loss.dtype)      # (B, N_view, 4, 4)
 
         # Compute masks
         fg_mask = self.compute_fg_mask(gt_boxes3d=gt_boxes3d,
                                        shape=shape,
-                                       lidar2imgs=lidar2img,
+                                       lidar2imgs=lidar2imgs,
                                        device=loss.device)    # (B, N_view, H, W)
         fg_mask = fg_mask.view(-1)
         bg_mask = ~fg_mask
@@ -911,14 +900,7 @@ class PETRDepthHeadV2(PETRDepthHead):
         coords = torch.cat([coords, depth_map], dim=-1)     # (B, N_view, W, H, 3)   (du, dv, d)
         coords = torch.cat([coords, torch.ones_like(coords[..., :1])], dim=-1)  # (B, N_view, W, H, 4)   (du, dv, d, 1)
 
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(np.linalg.inv(img_meta['lidar2img'][i]))
-            img2lidars.append(np.asarray(img2lidar))
-        img2lidars = np.asarray(img2lidars)
-        img2lidars = coords.new_tensor(img2lidars)  # (B, N_view, 4, 4)
+        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype)  # (B, N_view, 4, 4)
 
         coords = coords.unsqueeze(dim=-1)       # (B, N_view, W, H, 4, 1)
         # (B, N_view, 1, 1, 4, 4) --> (B, N_view, W, H, 4, 4)
@@ -1003,16 +985,6 @@ class PETRDepthHeadV2(PETRDepthHead):
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
                 depth, x = self.depth_net(x, intrinsics, extrinsics)
-            # for vis
-            # for j in range(depth.shape[0]):
-            #     cur_depth_score = depth_score[j]  # (D, fH, fW)
-            #     max_depth = torch.argmax(cur_depth_score, dim=0)  # (fH, fW)
-            #     max_depth = max_depth.detach().cpu().numpy()
-            #     max_depth = max_depth * 255 / 63
-            #     max_depth = max_depth.astype(np.uint8)
-            #     depth_score_map = cv2.applyColorMap(max_depth, cv2.COLORMAP_RAINBOW)
-            #     cv2.imshow("score_map", depth_score_map)
-            #     cv2.waitKey(0)
 
             if self.use_prob_depth:
                 self.depth_score = depth   # 未经过softmax
@@ -1450,16 +1422,6 @@ class PETRDepthHeadV2_Refine(PETRDepthHeadV2):
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
                 depth, x = self.depth_net(x, intrinsics, extrinsics)
-            # for vis
-            # for j in range(depth.shape[0]):
-            #     cur_depth_score = depth_score[j]  # (D, fH, fW)
-            #     max_depth = torch.argmax(cur_depth_score, dim=0)  # (fH, fW)
-            #     max_depth = max_depth.detach().cpu().numpy()
-            #     max_depth = max_depth * 255 / 63
-            #     max_depth = max_depth.astype(np.uint8)
-            #     depth_score_map = cv2.applyColorMap(max_depth, cv2.COLORMAP_RAINBOW)
-            #     cv2.imshow("score_map", depth_score_map)
-            #     cv2.waitKey(0)
 
             if self.use_prob_depth:
                 self.depth_score = depth   # 未经过softmax
@@ -1721,14 +1683,7 @@ class PETRDepthHeadV3(PETRDepthHeadV2):
         """
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
 
-        lidar2imgs = []
-        for img_meta in img_metas:
-            lidar2img = []
-            for i in range(len(img_meta['lidar2img'])):
-                lidar2img.append(img_meta['lidar2img'][i])
-            lidar2imgs.append(np.asarray(lidar2img))
-        lidar2img = np.asarray(lidar2imgs)
-        lidar2img = reference_points.new_tensor(lidar2img)      # (B, N_view, 4, 4)
+        lidar2img = stack_img_meta_matrices(img_metas, 'lidar2img', reference_points.device, reference_points.dtype)      # (B, N_view, 4, 4)
 
         bs, n_view = lidar2img.shape[0], lidar2img.shape[1]
         n_query = reference_points.shape[1]
@@ -1849,16 +1804,6 @@ class PETRDepthHeadV3(PETRDepthHeadV2):
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
                 depth, x = self.depth_net(x, intrinsics, extrinsics)
-            # for vis
-            # for j in range(depth.shape[0]):
-            #     cur_depth_score = depth_score[j]  # (D, fH, fW)
-            #     max_depth = torch.argmax(cur_depth_score, dim=0)  # (fH, fW)
-            #     max_depth = max_depth.detach().cpu().numpy()
-            #     max_depth = max_depth * 255 / 63
-            #     max_depth = max_depth.astype(np.uint8)
-            #     depth_score_map = cv2.applyColorMap(max_depth, cv2.COLORMAP_RAINBOW)
-            #     cv2.imshow("score_map", depth_score_map)
-            #     cv2.waitKey(0)
 
             if self.use_prob_depth:
                 self.depth_score = depth  # 未经过softmax
@@ -2070,14 +2015,7 @@ class PETRDepthGTHead(PETRHead):
         coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(
             coords[..., 2:3]) * eps)  # (B, N_view, W, H, 4)    4: (du, dv, d, 1)
 
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidar = []
-            for i in range(len(img_meta['lidar2img'])):
-                img2lidar.append(np.linalg.inv(img_meta['lidar2img'][i]))
-            img2lidars.append(np.asarray(img2lidar))
-        img2lidars = np.asarray(img2lidars)
-        img2lidars = coords.new_tensor(img2lidars)  # (B, N_view, 4, 4)
+        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype)  # (B, N_view, 4, 4)
 
         coords = coords.unsqueeze(dim=-1)       # (B, N_view, W, H, 4, 1)
         # (B, N_view, 1, 1, 4, 4) --> (B, N_view, W, H, 4, 4)
@@ -2237,5 +2175,3 @@ class PETRDepthGTHead(PETRHead):
             'enc_bbox_preds': None,
         }
         return outs
-
-

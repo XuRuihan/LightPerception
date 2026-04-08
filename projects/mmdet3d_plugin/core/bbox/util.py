@@ -1,5 +1,40 @@
+import math
+
 import torch 
 from .array_converter import array_converter
+
+
+def atan2_onnx_compatible(y, x):
+    """Approximate torch.atan2 with ONNX-supported ops during export."""
+    safe_x = torch.where(x == 0, torch.ones_like(x), x)
+    angle = torch.atan(y / safe_x)
+
+    pi = angle.new_tensor(math.pi)
+    half_pi = angle.new_tensor(math.pi / 2.0)
+    zero = torch.zeros_like(angle)
+
+    angle = torch.where(
+        x > 0,
+        angle,
+        torch.where(y >= 0, angle + pi, angle - pi),
+    )
+    angle = torch.where(
+        x == 0,
+        torch.where(
+            y > 0,
+            half_pi,
+            torch.where(y < 0, -half_pi, zero),
+        ),
+        angle,
+    )
+    return angle
+
+
+def exportable_atan2(y, x):
+    if torch.onnx.is_in_onnx_export():
+        return atan2_onnx_compatible(y, x)
+    return torch.atan2(y, x)
+
 
 @array_converter(apply_to=('points', 'cam2img'))
 def points_img2cam(points, cam2img):
@@ -58,9 +93,8 @@ def normalize_bbox(bboxes, pc_range):
     return normalized_bboxes
 
 def denormalize_bbox(normalized_bboxes, pc_range):
-    # rotation 
+    # rotation
     rot_sine = normalized_bboxes[..., 6:7]
-
     rot_cosine = normalized_bboxes[..., 7:8]
     rot = torch.atan2(rot_sine, rot_cosine)
 
@@ -73,10 +107,10 @@ def denormalize_bbox(normalized_bboxes, pc_range):
     w = normalized_bboxes[..., 2:3]
     l = normalized_bboxes[..., 3:4]
     h = normalized_bboxes[..., 5:6]
-
-    w = w.exp() 
-    l = l.exp() 
-    h = h.exp() 
+    
+    w = w.exp()
+    l = l.exp()
+    h = h.exp()
     if normalized_bboxes.size(-1) > 8:
          # velocity 
         vx = normalized_bboxes[:, 8:9]

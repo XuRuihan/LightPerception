@@ -7,21 +7,25 @@
 # Modified from mmdetection3d (https://github.com/open-mmlab/mmdetection3d)
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
-import torch
-import mmcv
-import numpy as np
-from mmcv.parallel import DataContainer as DC
-from os import path as osp
 import copy
-from mmcv.runner import force_fp32, auto_fp16
-from mmdet.models import DETECTORS
-from mmdet3d.core import bbox3d2result
-from mmdet3d.core import (CameraInstance3DBoxes,LiDARInstance3DBoxes, bbox3d2result,
-                          show_multi_modality_result)
-from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
-from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
+import os
+import random
+from os import path as osp
+
 import cv2
+import mmcv
+import torch
 from einops import rearrange
+from mmcv.parallel import DataContainer as DC
+from mmcv.runner import auto_fp16, force_fp32
+from mmdet3d.core import (CameraInstance3DBoxes, LiDARInstance3DBoxes,
+                          bbox3d2result, show_multi_modality_result)
+from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
+from mmdet.models import DETECTORS
+
+from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
+
+
 def IOU (intputs,targets):
     numerator = 2 * (intputs * targets).sum(dim=1)
     denominator = intputs.sum(dim=1) + targets.sum(dim=1)
@@ -69,11 +73,8 @@ class Petr3D_seg(MVXTwoStageDetector):
             for img_meta in img_metas:
                 img_meta.update(input_shape=input_shape)
             if img.dim() == 5:
-                if img.size(0) == 1 and img.size(1) != 1:
-                    img.squeeze_()
-                else:
-                    B, N, C, H, W = img.size()
-                    img = img.view(B * N, C, H, W)
+                B, N, C, H, W = img.size()
+                img = img.view(B * N, C, H, W)
             if self.use_grid_mask:
                 img = self.grid_mask(img)
             img_feats = self.img_backbone(img)
@@ -186,22 +187,19 @@ class Petr3D_seg(MVXTwoStageDetector):
     
     
     def img_show(self, imgs):
-        import os
-        import cv2
-        import random
-        import numpy as np
-        mean= np.array([103.530, 116.280, 123.675])
+
+        mean= torch.tensor([103.530, 116.280, 123.675])
         mean = mean.reshape(1,1,3)
         if not os.path.exists("./imgs"):
             os.makedirs("./imgs")
         name = str(random.randint(1,20))
         for i in range(imgs.size(1)):
             img = imgs[0][i]
-            img = img.permute(1, 2, 0).detach().cpu().numpy()
-            img = img + mean
+            img = img.permute(1, 2, 0).detach().cpu()
+            img = (img + mean).to(torch.uint8).numpy()
             # print(img)
 
-            cv2.imwrite("./imgs/"+name+"_"+str(i)+".png", img.astype(np.uint8))
+            cv2.imwrite("./imgs/"+name+"_"+str(i)+".png", img)
             print(img.shape)
 
     
@@ -346,4 +344,3 @@ class Petr3D_seg(MVXTwoStageDetector):
                     file_name,
                     'lidar',
                     show=False)
-

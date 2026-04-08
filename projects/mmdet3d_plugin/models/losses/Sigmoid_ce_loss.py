@@ -12,8 +12,6 @@ import torch.nn.functional as F
 from mmdet.core import bbox_overlaps
 from mmdet.models.builder import LOSSES
 from mmdet.models.losses.utils import weighted_loss
-import numpy as np
-
 
 
 @LOSSES.register_module()
