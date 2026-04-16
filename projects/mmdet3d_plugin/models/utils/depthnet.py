@@ -44,6 +44,42 @@ def build_depth_block(block_type, channels):
     raise ValueError(f'Unsupported depth block type: {block_type}')
 
 
+def normpos2posemb2d(pos, num_pos_feats=128, temperature=10000):
+    """Sine/cosine positional encoding for 2D coordinates.
+    for `pos` within range (-1, 1), the coefficient is in the range of [10000^(-1/2), 10000^(1/2)].
+    Args:
+        pos: (..., 2), in the normalized coordinate space, where the range is (approximately) `(-1, 1)`.
+        num_pos_feats: The dimension of the positional encoding. Default: 128.
+        temperature: The temperature used in the positional encoding. Default: 10000.
+    Returns:
+        pos_emb: (..., C), where C = num_pos_feats * 2
+    """
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+    dim_t = temperature ** (0.5 - 2 * (dim_t // 2) / num_pos_feats)  # `pos` in [-1, 1]
+
+    pos = pos[..., None] * dim_t
+    pos = torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=-1).flatten(-2)  # flatten sin and cos encodings
+    return pos.flatten(-2)  # flatten x and y positional encodings
+
+
+def pos2posemb2d(pos, num_pos_feats=128, temperature=10000):
+    """Sine/cosine positional encoding for 2D coordinates.
+    for `pos` in the range [-1000, 1000], the coefficient is in the range of [10000^(-1), 1].
+    Args:
+        pos: (..., 2), where the range is (approximately) `(-1000, 1000)`.
+        num_pos_feats: The dimension of the positional encoding. Default: 128.
+        temperature: The temperature used in the positional encoding. Default: 10000.
+    Returns:
+        pos_emb: (..., C), where C = num_pos_feats * 2
+    """
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+    dim_t = temperature ** (-2 * (dim_t // 2) / num_pos_feats)  # `pos` in [-1000, 1000]
+
+    pos = pos[..., None] * dim_t
+    pos = torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=-1).flatten(-2)  # flatten sin and cos encodings
+    return pos.flatten(-2)  # flatten x and y positional encodings
+
+
 class _ASPPModule(nn.Module):
     def __init__(self, inplanes, planes, kernel_size, padding, dilation,
                  BatchNorm):
@@ -222,9 +258,6 @@ class CameraAwareDepthNet(nn.Module):
             conv_cfg=dict(type='Conv2d'),
             norm_cfg=dict(type='BN2d'),
         )
-        self.bn1 = nn.BatchNorm1d(num_params1)  # context feature 与内外参有关
-        self.context_mlp = Mlp(num_params1, mid_channels, mid_channels)
-        self.context_se = SELayer(mid_channels)
         if with_context_encoder:
             self.context_conv = nn.Sequential(
                 BasicBlock(mid_channels, mid_channels),
@@ -235,9 +268,10 @@ class CameraAwareDepthNet(nn.Module):
         else:
             self.context_conv = nn.Conv2d(mid_channels, context_channels, kernel_size=1, stride=1, padding=0)
 
-        self.bn2 = nn.BatchNorm1d(num_params2)  # depth feature 只与内参有关
-        self.depth_mlp = Mlp(num_params2, mid_channels, mid_channels)
-        self.depth_se = SELayer(mid_channels)
+        self.coord_num_pos_feats = mid_channels // 2
+        self.coord_embed_channels = self.coord_num_pos_feats * 2
+        self.depth_coord_proj = Conv(self.coord_embed_channels, mid_channels, act=False)
+        self.depth_focal_proj = Conv(self.coord_embed_channels, mid_channels, act=False)
         if with_depth_correction:
             self.depth_stem = nn.Sequential(
                 build_depth_block(depth_block_type, mid_channels),
@@ -281,12 +315,52 @@ class CameraAwareDepthNet(nn.Module):
                 nn.Conv2d(mid_channels, 1, kernel_size=1, stride=1, padding=0)
             )
 
-    def forward(self, x, intrinsics, extrinsics):
+    def _get_normalized_coord_features(self, intrinsics, image_shape, feat_shape):
+        """
+        Args:
+            intrinsics: (B, N_view, 3, 3)
+            image_shape: (B, N_view, 2), (img_h, img_w)
+            feat_shape: (H, W)
+        Returns:
+            coord_feat: (B*N_view, C_mid, H, W)
+        """
+        feat_h, feat_w = feat_shape
+        device = intrinsics.device
+        dtype = intrinsics.dtype
+
+        intrinsics = intrinsics.flatten(0, 1)
+        image_shape = image_shape.to(device=device, dtype=dtype).flatten(0, 1)
+        img_h, img_w = image_shape.unbind(dim=-1)
+
+        fx = intrinsics[:, 0, 0].abs().clamp(min=1e-5).view(-1, 1, 1)
+        fy = intrinsics[:, 1, 1].abs().clamp(min=1e-5).view(-1, 1, 1)
+        cx = intrinsics[:, 0, 2].view(-1, 1, 1)
+        cy = intrinsics[:, 1, 2].view(-1, 1, 1)
+
+        u = (torch.arange(feat_w, device=device, dtype=dtype) + 0.5).view(1, 1, feat_w)
+        v = (torch.arange(feat_h, device=device, dtype=dtype) + 0.5).view(1, feat_h, 1)
+        grid_u = u * (img_w.view(-1, 1, 1) / feat_w / fx)
+        grid_v = v * (img_h.view(-1, 1, 1) / feat_h / fy)
+
+        norm_u = (grid_u - cx / fx).expand(-1, feat_h, -1)
+        norm_v = (grid_v - cy / fy).expand(-1, -1, feat_w)
+        norm_coords = torch.stack((norm_u, norm_v), dim=-1)
+
+        coord_feat = normpos2posemb2d(norm_coords, num_pos_feats=self.coord_num_pos_feats)
+        coord_feat = self.depth_coord_proj(coord_feat.permute(0, 3, 1, 2).contiguous())
+        # return torch.sigmoid(coord_feat)
+        norm_focal = torch.cat((fx, fy), dim=1).squeeze(-1)
+        focal_feat = pos2posemb2d(norm_focal, num_pos_feats=self.coord_num_pos_feats)
+        focal_feat = self.depth_focal_proj(focal_feat[..., None, None])
+        return torch.sigmoid(coord_feat + focal_feat)
+
+    def forward(self, x, intrinsics, extrinsics, image_shape=None):
         """
         Args:
             x: img feature map  (B*N_view, C, H, W)
             intrinsics: (B, N_view, 3, 3)
             extrinsics: (B, N_view, 4, 4)
+            image_shape: (B, N_view, 2), (img_h, img_w)
         Returns:
             depth:  (B*N_view, D, H, W)
             context: (B*N_view, C_context, H, W)
@@ -294,29 +368,27 @@ class CameraAwareDepthNet(nn.Module):
         B, N_view = intrinsics.shape[:2]
         intrinsics = intrinsics[..., :2, :]  # 6
         extrinsics = extrinsics[..., :3, :]  # 12
-        camera_params = torch.cat([intrinsics.view(B * N_view, -1), extrinsics.view(B * N_view, -1)], dim=-1)
 
         # (B*N_view, C, H, W) --> (B*N_view, C_mid, H, W)
         x = self.reduce_conv(x)
-        # context feature 与内外参有关
-        mlp_input = self.bn1(camera_params)
-        context_se = self.context_mlp(mlp_input)[..., None, None]  # (B*N_view, C_mid, 1, 1)
-        context = self.context_se(x, context_se)  # (B*N_view, C_mid, H, W)
-        context = self.context_conv(context)  # (B*N_view, C_context, H, W)
+        depth_input, context_input = x, x
+        context = self.context_conv(context_input)  # (B*N_view, C_context, H, W)
 
-        # depth feature 只与内参有关
-        mlp_input = self.bn2(intrinsics.view(B * N_view, -1))
-        depth_se = self.depth_mlp(mlp_input)[..., None, None]  # (B*N_view, C_mid, 1, 1)
-        depth = self.depth_se(x, depth_se)  # (B*N_view, C_mid, H, W)
+        # depth feature 显式注入归一化像素坐标 (u-cx)/fx, (v-cy)/fy
+        if image_shape is None:
+            raise ValueError('image_shape is required for CameraAwareDepthNet.')
+        coord_feat = self._get_normalized_coord_features(
+            intrinsics=intrinsics,
+            image_shape=image_shape,
+            feat_shape=depth_input.shape[-2:])
+        depth_feat = depth_input * coord_feat
+
+        depth_stem = self.depth_stem(depth_feat)
+        depth_prob = self.depth_prob_conv(depth_stem)  # (B*N_view, D, H, W)
         if not self.with_pgd:
-            depth_stem = self.depth_stem(depth)
-            depth_prob = self.depth_prob_conv(depth_stem)  # (B*N_view, D, H, W)
             return depth_prob, context
         else:
-            depth_stem = self.depth_stem(depth)
-            depth_prob = self.depth_prob_conv(depth_stem)
             depth_direct = self.depth_direct_conv(depth_stem)
-
             return depth_prob, context, depth_direct
 
 
@@ -363,7 +435,7 @@ class VanillaDepthNet(nn.Module):
         else:
             self.depth_conv = nn.Conv2d(mid_channels, depth_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x, intrinsics=None, extrinsics=None):
+    def forward(self, x, intrinsics=None, extrinsics=None, image_shape=None):
         """
         Args:
             x: img feature map  (B*N_view, C, H, W)
@@ -484,7 +556,7 @@ class CameraAwareDepthNetV2(nn.Module):
                 nn.Conv2d(mid_channels, 1, kernel_size=1, stride=1, padding=0)
             )
 
-    def forward(self, x, intrinsics, extrinsics):
+    def forward(self, x, intrinsics, extrinsics, image_shape=None):
         """
         Args:
             x: img feature map  (B*N_view, C, H, W)

@@ -40,6 +40,16 @@ def get_img2lidars(img_metas, device, dtype=torch.float32):
     return torch.linalg.inv(lidar2imgs)
 
 
+def get_pad_shapes(img_metas, device, dtype=torch.float32):
+    pad_shapes = []
+    for img_meta in img_metas:
+        cur_pad_shapes = []
+        for pad_shape in img_meta['pad_shape']:
+            cur_pad_shapes.append([pad_shape[0], pad_shape[1]])
+        pad_shapes.append(torch.as_tensor(cur_pad_shapes, device=device, dtype=dtype))
+    return torch.stack(pad_shapes, dim=0)
+
+
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     """
     Args:
@@ -89,35 +99,6 @@ class SELayer(nn.Module):
 
 @HEADS.register_module()
 class PETRDepthHead(PETRHead):
-    """Implements the DETR transformer head.
-    See `paper: End-to-End Object Detection with Transformers
-    <https://arxiv.org/pdf/2005.12872>`_ for details.
-    Args:
-        num_classes (int): Number of categories excluding the background.
-        in_channels (int): Number of channels in the input feature map.
-        num_query (int): Number of query in Transformer.
-        num_reg_fcs (int, optional): Number of fully-connected layers used in
-            `FFN`, which is then used for the regression head. Default 2.
-        transformer (obj:`mmcv.ConfigDict`|dict): Config for transformer.
-            Default: None.
-        sync_cls_avg_factor (bool): Whether to sync the avg_factor of
-            all ranks. Default to False.
-        positional_encoding (obj:`mmcv.ConfigDict`|dict):
-            Config for position encoding.
-        loss_cls (obj:`mmcv.ConfigDict`|dict): Config of the
-            classification loss. Default `CrossEntropyLoss`.
-        loss_bbox (obj:`mmcv.ConfigDict`|dict): Config of the
-            regression loss. Default `L1Loss`.
-        loss_iou (obj:`mmcv.ConfigDict`|dict): Config of the
-            regression iou loss. Default `GIoULoss`.
-        tran_cfg (obj:`mmcv.ConfigDict`|dict): Training config of
-            transformer head.
-        test_cfg (obj:`mmcv.ConfigDict`|dict): Testing config of
-            transformer head.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Default: None
-    """
-    _version = 2
     def __init__(self,
                  with_depth_supervision=True,
                  depthnet=dict(
@@ -220,6 +201,13 @@ class PETRDepthHead(PETRHead):
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims),
         )
+        # nn.init.constant_(self.adapt_pos3d[-1].weight, 0.)
+        # nn.init.constant_(self.adapt_pos3d[-1].bias, 0.)
+        # if self.with_position:
+        #     nn.init.constant_(self.position_encoder[-1].weight, 0.)
+        #     nn.init.constant_(self.position_encoder[-1].bias, 0.)
+        # nn.init.constant_(self.query_embedding[-1].weight, 0.)
+        # nn.init.constant_(self.query_embedding[-1].bias, 0.)
 
     def position_embeding(self, img_feats, img_metas, masks=None, depth_score=None):
         """
@@ -308,51 +296,41 @@ class PETRDepthHead(PETRHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
-        
-        x = mlvl_feats[0]   # (B, N_view, C, H, W)  只选择一个level的图像特征.
+
+        x = mlvl_feats[0]  # (B, N_view, C, H, W)  只选择一个level的图像特征.
         batch_size, num_cams, fH, fW = x.size(0), x.size(1), x.size(3), x.size(4)
         input_img_h, input_img_w, _ = img_metas[0]['pad_shape'][0]
         # 建立masks，图像中pad的部分为1, 用于在attention过程中消除pad部分的影响.
         masks = x.new_ones(
-            (batch_size, num_cams, input_img_h, input_img_w))    # (B, N_view, img_H, img_W)
+            (batch_size, num_cams, input_img_h, input_img_w))  # (B, N_view, img_H, img_W)
 
         for img_id in range(batch_size):
             for cam_id in range(num_cams):
                 img_h, img_w, _ = img_metas[img_id]['img_shape'][cam_id]
                 masks[img_id, cam_id, :img_h, :img_w] = 0
 
-        x = x.flatten(0, 1)    # (B*N_view, C, H, W)
+        x = x.flatten(0, 1)  # (B*N_view, C, H, W)
         if self.with_depth_supervision:
             # 获得相机内外参
             intrinsics_list = []
             extrinsics_list = []
             for batch_id in range(len(img_metas)):
-                cur_intrinsics = img_metas[batch_id]['intrinsics']    # List[(4, 4), (4, 4), ...]
-                cur_extrinsics = img_metas[batch_id]['extrinsics']    # List[(4, 4), (4, 4), ...]
-                cur_intrinsics = x.new_tensor(cur_intrinsics)    # (N_view, 4, 4)
-                cur_extrinsics = x.new_tensor(cur_extrinsics)    # (N_view, 4, 4)
+                cur_intrinsics = img_metas[batch_id]['intrinsics']  # List[(4, 4), (4, 4), ...]
+                cur_extrinsics = img_metas[batch_id]['extrinsics']  # List[(4, 4), (4, 4), ...]
+                cur_intrinsics = x.new_tensor(cur_intrinsics)  # (N_view, 4, 4)
+                cur_extrinsics = x.new_tensor(cur_extrinsics)  # (N_view, 4, 4)
                 intrinsics_list.append(cur_intrinsics)
                 extrinsics_list.append(cur_extrinsics)
-            intrinsics = torch.stack(intrinsics_list, dim=0)[..., :3, :3].contiguous()     # (B, N_view, 3, 3)
-            extrinsics = torch.stack(extrinsics_list, dim=0).contiguous()        # (B, N_view, 4, 4)
+            intrinsics = torch.stack(intrinsics_list, dim=0)[..., :3, :3].contiguous()  # (B, N_view, 3, 3)
+            extrinsics = torch.stack(extrinsics_list, dim=0).contiguous()  # (B, N_view, 4, 4)
+            image_shape = get_pad_shapes(img_metas, x.device, x.dtype)
 
             # (B*N_view, D, H, W), (B*N_view, C, H, W)
-            depth, x = self.depth_net(x, intrinsics, extrinsics)
+            depth, x = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
             if self.use_sigmoid:
                 depth_score = depth.sigmoid()
             else:
                 depth_score = depth.softmax(dim=1)
-
-            # for vis
-            # for j in range(depth.shape[0]):
-            #     cur_depth_score = depth_score[j]  # (D, fH, fW)
-            #     max_depth = torch.argmax(cur_depth_score, dim=0)  # (fH, fW)
-            #     max_depth = max_depth.detach().cpu()
-            #     max_depth = max_depth * 255 / 63
-            #     max_depth = max_depth.to(torch.uint8)
-            #     depth_score_map = cv2.applyColorMap(max_depth, cv2.COLORMAP_RAINBOW)
-            #     cv2.imshow("score_map", depth_score_map)
-            #     cv2.waitKey(0)
 
             self.depth_score = depth_score
             depth_score = depth_score.view(batch_size, num_cams, -1, fH, fW)
@@ -361,10 +339,10 @@ class PETRDepthHead(PETRHead):
 
         # (B*N_view, C, H, W) --> (B*N_view, C'=embed_dim, H, W)
         x = self.input_proj(x)
-        x = x.view(batch_size, num_cams, *x.shape[-3:])     # (B, N_view, C'=embed_dim, H, W)
+        x = x.view(batch_size, num_cams, *x.shape[-3:])  # (B, N_view, C'=embed_dim, H, W)
         # interpolate masks to have the same spatial shape with x
         masks = F.interpolate(
-            masks, size=x.shape[-2:]).to(torch.bool)    # (B, N_view, H, W)
+            masks, size=x.shape[-2:]).to(torch.bool)  # (B, N_view, H, W)
 
         if self.with_position:
             # 额, 但是这里没有使用coords_mask.
@@ -419,13 +397,13 @@ class PETRDepthHead(PETRHead):
         # import time
         # torch.cuda.synchronize()
         # time1 = time.time()
-        outs_dec, _ = self.transformer(x,   # (B, N_view, embed_dim, H, W)
-                                       masks,   # (B, N_view, H, W)
-                                       query_embeds,    # (N_query, embed_dims)
-                                       pos_embed,       # (B, N_view, embed_dims, H, W)
-                                       self.reg_branches    # 没有进行box_refine, 因此没有用到reg_branches.
+        outs_dec, _ = self.transformer(x,  # (B, N_view, embed_dim, H, W)
+                                       masks,  # (B, N_view, H, W)
+                                       query_embeds,  # (N_query, embed_dims)
+                                       pos_embed,  # (B, N_view, embed_dims, H, W)
+                                       self.reg_branches,  # 没有进行box_refine, 因此没有用到reg_branches.
                                        )
-        # outs_dec = torch.nan_to_num(outs_dec)       # (num_layers, B, N_query, C=embed_dims)
+        # outs_dec = torch.nan_to_num(outs_dec)  # (num_layers, B, N_query, C=embed_dims)
         # torch.cuda.synchronize()
         # time2 = time.time()
         # print("time = %f ms" % ((time2 - time1) * 1000))
@@ -433,23 +411,23 @@ class PETRDepthHead(PETRHead):
         outputs_classes = []
         outputs_coords = []
         for lvl in range(outs_dec.shape[0]):
-            reference = inverse_sigmoid(reference_points.clone())   # (B, N_query, 3)
+            reference = inverse_sigmoid(reference_points.clone())  # (B, N_query, 3)
             assert reference.shape[-1] == 3
-            outputs_class = self.cls_branches[lvl](outs_dec[lvl])   # (B, N_query, n_cls)
+            outputs_class = self.cls_branches[lvl](outs_dec[lvl])  # (B, N_query, n_cls)
             # (B, N_query, code_size)     code_size: (tx, ty, log(dx), log(dy), tz, log(dz), sin(rot), cos(rot), vx, vy)
             tmp = self.reg_branches[lvl](outs_dec[lvl])
             tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()     # (normalized_cx, normalized_cy)
+            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()  # (normalized_cx, normalized_cy)
             tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()     # normalized_cz
+            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()  # normalized_cz
 
             # (B, N_query, code_size)  code_size: (normalized_cx, normalized_cy, log(dx), log(dy), normalized_cz, log(dz), sin(rot), cos(rot), vx, vy)
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
 
-        all_cls_scores = torch.stack(outputs_classes)   # (num_layers, B, N_query, n_cls)
-        all_bbox_preds = torch.stack(outputs_coords)    # (num_layers, B, N_query, code_size)
+        all_cls_scores = torch.stack(outputs_classes)  # (num_layers, B, N_query, n_cls)
+        all_bbox_preds = torch.stack(outputs_coords)  # (num_layers, B, N_query, code_size)
 
         # (B, N_query, code_size)  code_size: (cx, cy, log(dx), log(dy), cz, log(dz), sin(rot), cos(rot), vx, vy)
         all_bbox_preds[..., 0:1] = (all_bbox_preds[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
@@ -460,7 +438,7 @@ class PETRDepthHead(PETRHead):
             'all_cls_scores': all_cls_scores,
             'all_bbox_preds': all_bbox_preds,
             'enc_cls_scores': None,
-            'enc_bbox_preds': None, 
+            'enc_bbox_preds': None,
         }
         if self.depth_net is not None:
             outs['depth'] = depth_score.view(batch_size*num_cams, -1, fH, fW)
@@ -579,9 +557,9 @@ class PETRDepthHead(PETRHead):
         Returns:
 
         """
-        depth = depth.permute(0, 2, 3, 1).contiguous().view(-1, self.depth_num)      # (B*N_view*H*W, D)
-        depth_map = depth_map.view(-1)                          # (B*N_view*H*W, )
-        depth_map_mask = depth_map_mask.view(-1).float()                # (B*N_view*H*W, )
+        depth = depth.permute(0, 2, 3, 1).contiguous().view(-1, self.depth_num)  # (B*N_view*H*W, D)
+        depth_map = depth_map.view(-1)  # (B*N_view*H*W, )
+        depth_map_mask = depth_map_mask.view(-1).float()  # (B*N_view*H*W, )
 
         min_dist = self.depth_start
         if self.LID:
@@ -593,19 +571,6 @@ class PETRDepthHead(PETRHead):
 
         depth_label = depth_label.long()
         depth_label, depth_map_mask = self.mask_points_by_dist(depth_label, depth_map_mask, 0, self.depth_num)
-
-        # for vis
-        # depth_gt = depth_label.float().detach().cpu().reshape((6, 16, 44))
-        # depth_mask = depth_map_mask.float().detach().cpu().reshape((6, 16, 44))
-        # depth_gt = depth_gt / self.depth_num * 255
-        # depth_gt = depth_gt.to(torch.uint8)
-        # depth_mask *= 255
-        # depth_mask = depth_mask.to(torch.uint8)
-        # for i in range(6):
-        #     depth_gt_vis = cv2.applyColorMap(depth_gt[i], colormap=cv2.COLORMAP_RAINBOW)
-        #     cv2.imshow(f'depth {i}', depth_gt_vis)
-        #     cv2.imshow(f'depth_mask{i}', depth_mask[i])
-        #     cv2.waitKey(0)
 
         loss_depth = self.loss_depth(depth, depth_label, depth_map_mask,
                                      avg_factor=max(depth_map_mask.sum().float(), 1.0))
@@ -854,6 +819,17 @@ class PETRDepthHeadV2(PETRDepthHead):
                 nn.LayerNorm(self.embed_dims),
                 nn.ReLU(inplace=True),
             )
+        # if hasattr(self, 'adapt_pos3d'):
+        #     nn.init.constant_(self.adapt_pos3d[-1].weight, 0.)
+        #     nn.init.constant_(self.adapt_pos3d[-1].bias, 0.)
+        # if hasattr(self, 'position_encoder'):
+        #     nn.init.constant_(self.position_encoder[-1].weight, 0.)
+        #     nn.init.constant_(self.position_encoder[-1].bias, 0.)
+        # nn.init.constant_(self.query_embedding[-1].weight, 0.)
+        # nn.init.constant_(self.query_embedding[-1].bias, 0.)
+        # if hasattr(self, 'v_position_embedding'):
+        #     nn.init.constant_(self.v_position_embedding[-1].weight, 0.)
+        #     nn.init.constant_(self.v_position_embedding[-1].bias, 0.)
 
     def integral(self, depth_pred):
         """
@@ -879,44 +855,31 @@ class PETRDepthHeadV2(PETRDepthHead):
         eps = 1e-5
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
         B, N, C, H, W = img_feats[self.position_level].shape
+        device = img_feats[0].device
+        dtype = depth_map.dtype
+
         # 映射到原图尺度上，得到对应的像素坐标.
-        coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H  # (H, )
-        coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W  # (W, )
+        coords_h = torch.arange(H, device=device, dtype=dtype) * (pad_h / H)  # (H, )
+        coords_w = torch.arange(W, device=device, dtype=dtype) * (pad_w / W)  # (W, )
+        grid_w, grid_h = torch.meshgrid(coords_w, coords_h)
+        pixel_coords = torch.stack((grid_w, grid_h), dim=-1).view(1, 1, W, H, 2)  # (1, 1, W, H, 2)
 
-        # (2, W, H)  --> (W, H, 2)    2: (u, v)
-        coords = torch.stack(torch.meshgrid([coords_w, coords_h])).permute(1, 2, 0).contiguous()
-        coords = coords.view(1, 1, W, H, 2).repeat(B, N, 1, 1, 1)       # (B, N_view, W, H, 2)
+        depth = depth_map.permute(0, 1, 3, 2).contiguous().unsqueeze(-1)  # (B, N_view, W, H, 1)
+        depth_scale = depth
+        frustum = torch.cat(
+            (pixel_coords * depth_scale, depth_scale, torch.ones_like(depth_scale)),
+            dim=-1,
+        )  # (B, N_view, W, H, 4)
 
-        depth_map = depth_map.permute(0, 1, 3, 2).contiguous()      # (B, N_view, W, H)
-
-        # inplace
-        # coords = torch.cat((coords, depth_map.unsqueeze(dim=-1)), dim=-1)       # (B, N_view, W, H, 3)   3:(u, v, d)
-        # coords = torch.cat((coords, torch.ones_like(coords[..., :1])), -1)    # (B, N_view, W, H, 4)    4: (u, v, d, 1)
-        # coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(
-        #     coords[..., 2:3]) * eps)  # (B, N_view, W, H, 4)    4: (du, dv, d, 1)
-
-        depth_map = depth_map.unsqueeze(dim=-1)     # (B, N_view, W, H, 1)
-        coords = coords * torch.maximum(depth_map, torch.ones_like(depth_map) * eps)  # (B, N_view, W, H, 2)    (du, dv)
-        coords = torch.cat([coords, depth_map], dim=-1)     # (B, N_view, W, H, 3)   (du, dv, d)
-        coords = torch.cat([coords, torch.ones_like(coords[..., :1])], dim=-1)  # (B, N_view, W, H, 4)   (du, dv, d, 1)
-
-        img2lidars = get_img2lidars(img_metas, coords.device, coords.dtype)  # (B, N_view, 4, 4)
-
-        coords = coords.unsqueeze(dim=-1)       # (B, N_view, W, H, 4, 1)
-        # (B, N_view, 1, 1, 4, 4) --> (B, N_view, W, H, 4, 4)
-        img2lidars = img2lidars.view(B, N, 1, 1, 4, 4).repeat(1, 1, W, H, 1, 1)
+        img2lidars = get_img2lidars(img_metas, device, dtype).view(B, N, 1, 1, 4, 4)  # (B, N_view, 1, 1, 4, 4)
 
         # 图像中每个像素对应的frustum points，借助img2lidars投影到lidar系中.
-        # (B, N_view, W, H, 4, 4) @ (B, N_view, H, D, 4, 1) --> (B, N_view, W, H, 4, 1)
-        # --> (B, N_view, W, H, 3)   3: (x, y, z)
-        coords3d = torch.matmul(img2lidars, coords).squeeze(-1)[..., :3]
+        # 广播 matmul，避免为每个像素显式 repeat img2lidars.
+        coords3d = torch.matmul(img2lidars, frustum.unsqueeze(-1)).squeeze(-1)[..., :3]
+
         # 借助position_range，对3D坐标进行归一化.
-        coords3d[..., 0:1] = (coords3d[..., 0:1] - self.position_range[0]) / (
-                    self.position_range[3] - self.position_range[0])
-        coords3d[..., 1:2] = (coords3d[..., 1:2] - self.position_range[1]) / (
-                    self.position_range[4] - self.position_range[1])
-        coords3d[..., 2:3] = (coords3d[..., 2:3] - self.position_range[2]) / (
-                    self.position_range[5] - self.position_range[2])
+        position_range = coords3d.new_tensor(self.position_range)
+        coords3d = (coords3d - position_range[:3]) / (position_range[3:] - position_range[:3])
         return coords3d
 
     def position_embeding(self, img_feats, img_metas, masks=None, depth_map=None):
@@ -978,13 +941,14 @@ class PETRDepthHeadV2(PETRDepthHead):
                 extrinsics_list.append(cur_extrinsics)
             intrinsics = torch.stack(intrinsics_list, dim=0)[..., :3, :3].contiguous()  # (B, N_view, 3, 3)
             extrinsics = torch.stack(extrinsics_list, dim=0).contiguous()  # (B, N_view, 4, 4)
+            image_shape = get_pad_shapes(img_metas, x.device, x.dtype)
 
             # (B*N_view, D, H, W), (B*N_view, C, H, W), (B*N_view, 1, H, W)
             if self.with_pgd:
-                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics)
+                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
-                depth, x = self.depth_net(x, intrinsics, extrinsics)
+                depth, x = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
 
             if self.use_prob_depth:
                 self.depth_score = depth   # 未经过softmax
@@ -1373,6 +1337,17 @@ class PETRDepthHeadV2_Refine(PETRDepthHeadV2):
                     nn.ReLU(),
                     nn.Linear(self.embed_dims, self.embed_dims),
                 )
+        # if hasattr(self, 'adapt_pos3d'):
+        #     nn.init.constant_(self.adapt_pos3d[-1].weight, 0.)
+        #     nn.init.constant_(self.adapt_pos3d[-1].bias, 0.)
+        # if hasattr(self, 'position_encoder'):
+        #     nn.init.constant_(self.position_encoder[-1].weight, 0.)
+        #     nn.init.constant_(self.position_encoder[-1].bias, 0.)
+        # nn.init.constant_(self.query_embedding[-1].weight, 0.)
+        # nn.init.constant_(self.query_embedding[-1].bias, 0.)
+        # if hasattr(self, 'v_position_embedding'):
+        #     nn.init.constant_(self.v_position_embedding[-1].weight, 0.)
+        #     nn.init.constant_(self.v_position_embedding[-1].bias, 0.)
 
     def forward(self, mlvl_feats, img_metas):
         """Forward function.
@@ -1415,13 +1390,14 @@ class PETRDepthHeadV2_Refine(PETRDepthHeadV2):
                 extrinsics_list.append(cur_extrinsics)
             intrinsics = torch.stack(intrinsics_list, dim=0)[..., :3, :3].contiguous()  # (B, N_view, 3, 3)
             extrinsics = torch.stack(extrinsics_list, dim=0).contiguous()  # (B, N_view, 4, 4)
+            image_shape = get_pad_shapes(img_metas, x.device, x.dtype)
 
             # (B*N_view, D, H, W), (B*N_view, C, H, W), (B*N_view, 1, H, W)
             if self.with_pgd:
-                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics)
+                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
-                depth, x = self.depth_net(x, intrinsics, extrinsics)
+                depth, x = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
 
             if self.use_prob_depth:
                 self.depth_score = depth   # 未经过softmax
@@ -1617,6 +1593,8 @@ class PETRDepthHeadV3(PETRDepthHeadV2):
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims),
         )
+        # nn.init.constant_(self.query_embedding[-1].weight, 0.)
+        # nn.init.constant_(self.query_embedding[-1].bias, 0.)
 
     def position_embeding(self, img_feats, img_metas, masks=None, depth_map=None):
         """
@@ -1797,13 +1775,14 @@ class PETRDepthHeadV3(PETRDepthHeadV2):
                 extrinsics_list.append(cur_extrinsics)
             intrinsics = torch.stack(intrinsics_list, dim=0)[..., :3, :3].contiguous()  # (B, N_view, 3, 3)
             extrinsics = torch.stack(extrinsics_list, dim=0).contiguous()  # (B, N_view, 4, 4)
+            image_shape = get_pad_shapes(img_metas, x.device, x.dtype)
 
             # (B*N_view, D, H, W), (B*N_view, C, H, W), (B*N_view, 1, H, W)
             if self.with_pgd:
-                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics)
+                depth, x, depth_direct = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
             else:
                 # (B * N_view, D/1, H, W),  (B*N_view, C, H, W)
-                depth, x = self.depth_net(x, intrinsics, extrinsics)
+                depth, x = self.depth_net(x, intrinsics, extrinsics, image_shape=image_shape)
 
             if self.use_prob_depth:
                 self.depth_score = depth  # 未经过softmax
@@ -1978,6 +1957,13 @@ class PETRDepthGTHead(PETRHead):
         self.reference_points = nn.Embedding(self.num_query, 3)
         # anchor points先生成位置编码，然后利用query_embedding生成初始的object queries.
         self.query_embedding = position_encoder
+        # nn.init.constant_(self.adapt_pos3d[-1].weight, 0.)
+        # nn.init.constant_(self.adapt_pos3d[-1].bias, 0.)
+        # if self.with_position:
+        #     nn.init.constant_(self.position_encoder[-1].weight, 0.)
+        #     nn.init.constant_(self.position_encoder[-1].bias, 0.)
+        # nn.init.constant_(self.query_embedding[-1].weight, 0.)
+        # nn.init.constant_(self.query_embedding[-1].bias, 0.)
 
     def position_embeding(self, img_feats, img_metas, masks=None, depth_map=None, depth_map_mask=None):
         """

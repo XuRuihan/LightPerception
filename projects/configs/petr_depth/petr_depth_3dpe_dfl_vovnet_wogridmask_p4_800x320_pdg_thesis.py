@@ -3,8 +3,12 @@ _base_ = [
 ]
 
 optimizer_config = dict(type='Fp16OptimizerHook', loss_scale=128., grad_clip=dict(max_norm=35, norm_type=2))
+# optimizer = dict(weight_decay=0.02)
 
 model = dict(
+    img_neck=dict(
+        norm_cfg=dict(type='BN2d', requires_grad=True),
+    ),
     pts_bbox_head=dict(
         depthnet=dict(
             with_context_encoder=False,
